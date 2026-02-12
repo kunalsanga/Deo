@@ -189,29 +189,121 @@ function openChatPanel(context: vscode.ExtensionContext) {
                     // Agent Logic Starts Here
                     const { TextDecoder } = require('util');
 
-                    const systemPrompt = `You are an autonomous coding agent. 
-You must create a comprehensive plan to fulfill the user's request using a sequence of actions.
-Return ONLY a strict JSON ARRAY of actions. No markdown. No explanations.
+                    // --- Inject Project Structure ---
+                    const workspaceFolder = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+                    let fileStructure = "Workspace is empty.";
 
-**IMPORTANT RULES**
-- If the user asks for more than one file (HTML + CSS, HTML + JS, etc.), emit a separate create_file action for each file.
+                    try {
+                        if (workspaceFolder) {
+                            const readDirRecursive = (dir: string, depth = 0): string[] => {
+                                if (depth > 2) { return []; } // Limit depth
+                                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                                const files = entries
+                                    .filter(e => !e.name.startsWith('.') && e.name !== 'node_modules')
+                                    .map(e => {
+                                        const prefix = "  ".repeat(depth);
+                                        if (e.isDirectory()) {
+                                            return `${prefix}- ${e.name}/\n${readDirRecursive(path.join(dir, e.name), depth + 1).join('')}`;
+                                        }
+                                        return `${prefix}- ${e.name}\n`;
+                                    });
+                                return files;
+                            };
+                            fileStructure = readDirRecursive(workspaceFolder).join('');
+
+                            // --- Refactor Mode: Inject File Contents ---
+                            let fileContents = "";
+                            let fileCount = 0;
+                            const MAX_FILES = 10;
+                            const MAX_CHARS = 20000;
+
+                            const readFileContentRecursive = (dir: string) => {
+                                if (fileCount >= MAX_FILES || fileContents.length >= MAX_CHARS) { return; }
+
+                                const entries = fs.readdirSync(dir, { withFileTypes: true });
+                                for (const entry of entries) {
+                                    if (fileCount >= MAX_FILES || fileContents.length >= MAX_CHARS) { break; }
+                                    if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'out') { continue; }
+
+                                    const fullPath = path.join(dir, entry.name);
+                                    if (entry.isDirectory()) {
+                                        readFileContentRecursive(fullPath);
+                                    } else if (entry.isFile()) {
+                                        const ext = path.extname(entry.name).toLowerCase();
+                                        if (['.js', '.ts', '.html', '.css', '.json', '.md', '.py', '.java', '.cpp', '.c', '.h', '.tsx', '.jsx'].includes(ext)) {
+                                            try {
+                                                const content = fs.readFileSync(fullPath, 'utf8');
+                                                if (content.length < 10000) { // Skip huge files
+                                                    fileContents += `\n--- File: ${path.relative(workspaceFolder, fullPath)} ---\n${content}\n`;
+                                                    fileCount++;
+                                                }
+                                            } catch (err) { /* ignore */ }
+                                        }
+                                    }
+                                }
+                            };
+
+                            readFileContentRecursive(workspaceFolder);
+                            if (fileContents.length > 0) {
+                                fileStructure += `\n\nContext - File Contents (First ${fileCount} files):\n${fileContents}`;
+                            }
+
+                            // Enhanced Context: Read package.json if available
+                            const packageJsonPath = path.join(workspaceFolder, 'package.json');
+                            if (fs.existsSync(packageJsonPath)) {
+                                try {
+                                    const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
+                                    fileStructure += `\n\npackage.json summary:\nDependencies: ${JSON.stringify(pkg.dependencies || {})}\nDevDependencies: ${JSON.stringify(pkg.devDependencies || {})}\nScripts: ${JSON.stringify(pkg.scripts || {})}`;
+                                } catch (e) { /* ignore */ }
+                            }
+                        }
+                    } catch (e) { console.error("Error reading file structure", e); }
+
+                    // --- Memory Compression ---
+                    let memorySummary = "No previous context.";
+                    const currentSession = sessions.find(s => s.id === activeSessionId);
+                    if (currentSession && currentSession.messages.length > 1) {
+                        // Get last 15 messages, excluding the current user request (which is the last one)
+                        const recentMsgs = currentSession.messages.slice(-16, -1);
+                        memorySummary = recentMsgs.map((m: any) => {
+                            if (m.type === 'user') { return `User: ${m.text}`; }
+                            if (m.type === 'ai') { return `AI: ${m.text.split('\n')[0]}...`; } // Summarize to first line
+                            if (m.type === 'step') { return `System: Action ${m.action} on ${m.path}`; }
+                            return '';
+                        }).filter((Boolean) as any).join('\n');
+                    }
+
+                    const systemPrompt = `You are Deo, an autonomous coding agent.
+Your job is to fully complete the user's request in ONE response.
+
+Context - Current Project Structure:
+${fileStructure}
+
+Context - Conversation History (Summary):
+${memorySummary}
+
+You must return a strict JSON object with this format:
+
+{
+  "plan": "Short description of what you will do",
+  "actions": [
+    {
+      "action": "create_folder" | "create_file" | "edit_file" | "insert_code",
+      "path": "relative/path/to/file/or/folder",
+      "content": "file content if needed"
+    }
+  ]
+}
+
+Rules:
+- Do NOT explain anything.
+- Do NOT use markdown.
+- Do NOT return text outside JSON.
+- Plan all steps in one response.
+- Never return partial results.
+- Always complete the full task.
 - The value of the "content" property must contain real line‑break characters, NOT the escaped sequence "\\n".
-- Do NOT wrap CSS in <style> tags and do NOT wrap JavaScript in <script> tags unless explicitly requested.
-- Emit a create_folder action before any files that belong to that folder.
-- Never concatenate the contents of different files into a single "content" string.
-
-Available actions:
-- create_folder: { "action": "create_folder", "path": "path/to/folder" }
-- create_file:   { "action": "create_file",   "path": "path/to/file",   "content": "file content" }
-- edit_file:     { "action": "edit_file",     "path": "path/to/file",   "content": "new complete content" }
-- insert_code:   { "action": "insert_code",   "content": "code snippet" } (Use this to answer questions or write to the active editor)
-
-Example Output:
-[
-  { "action": "create_folder", "path": "src/pages" },
-  { "action": "create_file", "path": "src/pages/login.html", "content": "<!DOCTYPE html>\\n<html>\\n  …\\n</html>" },
-  { "action": "create_file", "path": "src/pages/style.css", "content": "body {\\n  margin:0;\\n}\\n" }
-]
+- IMPORTANT: When writing file content, preserve proper indentation and formatting. Do NOT minify code. Do NOT compress code into one line. Use \n for line breaks.
 
 User Request: ${userPrompt}
 `;
@@ -238,49 +330,47 @@ User Request: ${userPrompt}
                             selectedModel = "qwen2.5:latest";
                         }
 
-                        // 1. Send Request to Ollama (Single Call)
-                        let fullAiResponse = "";
+                        // 1. Send Request to Ollama (One-Shot, No Streaming)
+                        panel.webview.postMessage({ command: 'receiveMessage', text: '🧠 Planning project structure...', isStreaming: false });
+
                         const response = await fetch('http://127.0.0.1:11434/api/generate', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({
                                 model: selectedModel,
                                 prompt: systemPrompt,
-                                stream: true,
-                                format: "json"
+                                stream: false, // Agent Mode = No Streaming
+                                format: "json",
+                                options: {
+                                    temperature: 0.2, // More deterministic
+                                    num_ctx: 8192    // Larger context window
+                                }
                             })
                         });
 
-                        if (!response.body) { throw new Error("No response body"); }
-
-                        const reader = response.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buffer = "";
-
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) { break; }
-                            const chunk = decoder.decode(value, { stream: true });
-                            buffer += chunk;
-                            const lines = buffer.split('\n');
-                            buffer = lines.pop() || "";
-                            for (const line of lines) {
-                                if (!line.trim()) { continue; }
-                                try {
-                                    const json = JSON.parse(line);
-                                    if (json.response) { fullAiResponse += json.response; }
-                                } catch (e) { console.error(e); }
-                            }
-                        }
+                        if (!response.ok) { throw new Error(`Ollama API Error: ${response.statusText}`); }
+                        const data = await response.json() as any;
+                        const fullAiResponse = data.response;
 
                         // 2. Parse Action Plan
                         let actionPlan: any[] = [];
+                        let planDescription = "Executing actions...";
                         try {
                             // Clean potential markdown wrappers
                             const cleanJson = fullAiResponse.replace(/```json/g, '').replace(/```/g, '').trim();
-                            // Handle case where model might return a single object instead of array
                             const parsed = JSON.parse(cleanJson);
-                            actionPlan = Array.isArray(parsed) ? parsed : [parsed];
+
+                            // Handle new format { plan: "...", actions: [...] }
+                            if (parsed.actions && Array.isArray(parsed.actions)) {
+                                actionPlan = parsed.actions;
+                                planDescription = parsed.plan || planDescription;
+                            } else if (Array.isArray(parsed)) {
+                                // Fallback for old format
+                                actionPlan = parsed;
+                            } else {
+                                // Single object fallback
+                                actionPlan = [parsed];
+                            }
                         } catch (e) {
                             console.error("JSON Parse Error:", fullAiResponse);
                             panel.webview.postMessage({ command: 'receiveMessage', text: "Error parsing agent plan. Please try again.", isStreaming: false });
@@ -288,14 +378,40 @@ User Request: ${userPrompt}
                             return;
                         }
 
-                        // 3. Execute Actions Sequentially
+                        // 3. Display Detailed Plan First (UX Upgrade)
                         const workspaceFolder = vscode.workspace.workspaceFolders?.[0].uri.fsPath;
+                        const createdFiles: string[] = [];
 
-                        panel.webview.postMessage({ command: 'receiveMessage', text: `📋 Executing ${actionPlan.length} steps...`, isStreaming: false });
+                        const stepList = actionPlan
+                            .filter(a => a.action !== 'done')
+                            .map((a, i) => {
+                                let icon = '🔸';
+                                if (a.action === 'create_folder') { icon = '📁'; }
+                                else if (a.action === 'create_file') { icon = '📄'; }
+                                else if (a.action === 'edit_file') { icon = '🎨'; }
+                                else if (a.action === 'insert_code') { icon = '📝'; }
+                                const actionName = a.action.replace('_', ' ').replace(/\b\w/g, (c: string) => c.toUpperCase());
+                                return `${i + 1}. ${icon} **${actionName}**: \`${a.path || 'Active Editor'}\``;
+                            })
+                            .join('\n');
+
+                        const planMessage = `🧠 **Plan:** ${planDescription}\n\n${stepList}\n\n*Executing...*`;
+                        panel.webview.postMessage({ command: 'receiveMessage', text: planMessage, isStreaming: false });
+                        updateHistory({ type: 'ai', text: planMessage });
+
+                        // 4. Execute Actions Sequentially
 
                         for (const actionData of actionPlan) {
                             // Handle "done" if present
                             if (actionData.action === 'done') { continue; }
+
+                            // UX: Update status based on action
+                            let statusMsg = 'Processing...';
+                            if (actionData.action === 'create_folder') { statusMsg = `📁 Creating folder: ${actionData.path}`; }
+                            else if (actionData.action === 'create_file') { statusMsg = `📄 Writing file: ${actionData.path}`; }
+                            else if (actionData.action === 'edit_file') { statusMsg = `🎨 Editing file: ${actionData.path}`; }
+
+                            panel.webview.postMessage({ command: 'receiveMessage', text: statusMsg, isStreaming: false });
 
                             let executionResult = "";
 
@@ -322,6 +438,19 @@ User Request: ${userPrompt}
                                             const cleanContent = decodeEscapes(actionData.content || '');
                                             fs.writeFileSync(targetPath, cleanContent);
                                             executionResult = `Success: Wrote to ${actionData.path}`;
+                                            if (actionData.action === 'create_file' || actionData.action === 'edit_file') {
+                                                createdFiles.push(actionData.path);
+
+                                                // Auto-Open & Format Immediately (Cursor-like experience)
+                                                try {
+                                                    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(targetPath));
+                                                    await vscode.window.showTextDocument(doc, { preview: false });
+                                                    // Small delay to ensure editor is active before formatting
+                                                    setTimeout(async () => {
+                                                        await vscode.commands.executeCommand('editor.action.formatDocument');
+                                                    }, 200);
+                                                } catch (e) { console.error("Error auto-opening file:", e); }
+                                            }
                                         }
 
                                         // Send Step Update Only on Success or actionable attempt
@@ -362,8 +491,14 @@ User Request: ${userPrompt}
                             }
                         }
 
-                        panel.webview.postMessage({ command: 'receiveMessage', text: "✅ Task Completed.", isStreaming: false });
-                        updateHistory({ type: 'ai', text: "✅ Task Completed." });
+                        // --- Summary & Polish ---
+                        let summaryText = "✅ Task Completed.";
+                        if (createdFiles.length > 0) {
+                            summaryText = `✅ Project Updated Successfully\n\n**Files Generated/Edited:**\n${createdFiles.map(f => `- ${f}`).join('\n')}`;
+                        }
+
+                        panel.webview.postMessage({ command: 'receiveMessage', text: summaryText, isStreaming: false });
+                        updateHistory({ type: 'ai', text: summaryText });
 
                     } catch (error: any) {
                         const errorMessage = `Error: ${error.message}`;
