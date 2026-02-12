@@ -10,16 +10,32 @@
     "Other"
   ],
   "activationEvents": [
-    "onCommand:deo.askAI"
+    "onStartupFinished",
+    "onCommand:deo.openChat",
+    "onCommand:deo.selectModel"
   ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "deo.askAI",
-        "title": "Ask Deo AI"
+        "command": "deo.openChat",
+        "title": "Deo: Open Chat"
+      },
+      {
+        "command": "deo.selectModel",
+        "title": "Deo: Select Model"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Deo",
+      "properties": {
+        "deo.selectedModel": {
+          "type": "string",
+          "default": "",
+          "description": "The Ollama model to use for Deo."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
